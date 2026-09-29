@@ -20,4 +20,8 @@ type Record struct {
 	Terminated bool
 	// TermReason 记录链路终止原因（canceled/timeout）。
 	TermReason string
+	// Unknown 保留记录级别解码时遇到的未知字段，key 为字段标签（u16），
+	// value 为该字段的原始字节（TLV 中的 value 部分）。
+	// 读旧数据后重新编码时原样写回，既不丢失也不错位；按 key 排序写出保证确定性。
+	Unknown map[uint16][]byte
 }

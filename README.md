@@ -29,23 +29,73 @@
 
 ## 版本兼容规则
 
-批次编码布局：`magic(2) | version(2) | [source(v2)] | records | unknown`。
+批次编码布局（当前写出 **v3**）：
 
-- 当前写出版本为 **v2**（新增 `Source` 字段）；**v1** 写出的批次在新版本中
-  仍可被正确读取（`Source` 置空）。
-- 解码遇到**未知字段**时保留进 `Batch.Unknown`，重编码不丢失。
+```
+magic(2) | version(2) | source(v2+) | nrecords(4) | records... | batch-unknown
+record = trace(8) | span(8) | level(1) | term(1) | message | termreason
+       | nattrs(2) {key value}... | rec-unknown(v3+)
+rec-unknown = n(2) { tag(2) | len(4) | value }...
+```
+
+- 写出版本为 **v3**；**v1** 批次（无 `Source`）与 **v2** 批次（无记录级未知区）
+  在新版本中仍可正确读取。v1/v2 数据读入后按 v3 重编码，内容无损。
+- **记录级未知字段**（v3）：当前版本读到未来版本给某条记录新增的字段时，
+  按字段标签（u16）+ 原始字节保存在 `Record.Unknown`，重新编码时原样写回，
+  不丢失、不与相邻字段错位。重复标签判为畸形（语义不明确，不静默覆盖）。
+- **批次级未知字段**：批次尾部不认识的字段保存在 `Batch.Unknown`，同样原样保留。
+- **确定性编码**：所有 map（attrs、记录级/批次级未知字段）均按 key 排序写出，
+  同一份输入反复编码的字节流完全一致；「读旧数据 → 重编码」的结果与原写法
+  字节级一致，便于 diff 比对。
 - **不支持的版本**返回 `ErrUnsupportedVersion`，明确拒绝而不是按默认值继续。
-- **畸形数据**（坏 magic、截断、超长长度、尾部多余字节）返回 `ErrMalformed`，
-  严格边界检查避免静默错列。
+- **畸形数据**（坏 magic、截断、超长长度、尾部多余字节、重复记录标签）返回
+  `ErrMalformed`，严格边界检查避免静默错列。
 
-## 背压与丢弃策略
+## 失败分级与丢弃原因
+
+导出失败先区分性质，再决定重试策略：
+
+| 失败性质 | 判定方式 | 行为 |
+|----------|----------|------|
+| **永久失败**（对方明确不要，再投无用） | 错误被 `Permanent(err)` 包装（`errors.As` 识别），或实现 `PermanentFailure()` 标记方法 | **立即停止重试**，只调用一次接收端 |
+| **暂时性失败**（对方暂时不可用） | 其余普通错误 | 指数退避重试，预算用尽才丢弃 |
+| **取消/超时** | `context.Canceled` / `context.DeadlineExceeded`（含 `%w` 包装） | 不退避，按取消处理 |
+
+`DropHandler` 回调的丢弃原因四者互斥、可区分：
+
+| 原因 | 字符串 | 含义 |
+|------|--------|------|
+| `DropQueueFull` | `queue_full` | 队列满，背压丢弃（连尝试都没有） |
+| `DropRetryExhausted` | `retry_exhausted` | 暂时性失败重试预算耗尽 |
+| `DropCanceled` | `canceled` | 管线关闭或上下文取消 |
+| `DropPermanent` | `permanent_rejected` | 接收端明确拒绝，未重试 |
+
+永久失败不占用重试预算、不与 `retry_exhausted` 混淆；`context` 取消错误不会
+被误判为永久失败。
+
+## 投递去重保证
+
+管线自身（而非调用方）保证：**同一 `Batch.ID` 的批次无论投递、重试多少次，
+包括并发重试，最终在接收端只出现一次可见到达**。实现由有界去重状态表
+（`dedupTable`）承担：
+
+- **singleflight 合并**：同一 ID 已有在途导出时，并发调用方作为 follower
+  等待 leader 的最终结论，不会各自再打一次接收端；leader 负责整轮退避重试。
+  leader 暂时性放弃后，等待者会接管登记重新尝试，不丢批。
+- **终结抑制**：导出成功或被永久拒绝后，ID 进入已终结集合；之后再投递同 ID
+  直接幂等跳过，不触达接收端，也不重复上报丢弃原因（永久失败只上报一次）。
+- **暂时性结论不记忆**：重试耗尽与取消不入集合，后续重新投递仍可正常再试。
+- **容量有界（FIFO 淘汰）**：已终结集合最多保留 `Config.DedupCap` 个 ID
+  （默认 `DefaultDedupCap = 4096`，`<=0` 取默认值）；超出时按终结顺序
+  淘汰最旧条目，长时间运行内存占用有界。被淘汰的 ID 再次投递会被视为新批次，
+  即去重窗口覆盖最近 `DedupCap` 个已终结批次——这是有界去重的固有取舍。
+  去重状态为进程内状态（与 TraceID 生成一样，不跨进程持久化）。
+
+## 背压与重试策略
 
 - 导出队列容量固定（`Config.QueueSize`），是采集侧的内存开销上限；
   `Submit` 非阻塞，队列满立即丢弃，采集侧绝不无界堆积。
-- 导出失败按指数退避重试（`Config.Retries` 次）；重试针对同一 `Batch.ID`，
-  接收端按 ID 去重，不产生重复可见数据。
-- 丢弃必须携带可区分原因并回调 `DropHandler`：
-  `DropQueueFull`（背压）、`DropRetryExhausted`（重试耗尽）、`DropCanceled`（关闭/取消）。
+- 暂时性失败按指数退避重试（`Config.Retries` 次）；永久失败不重试。
 - 配置通过 `atomic.Pointer` 整体替换：采样、缓存、攒批参数要么全部生效要么
   全部不生效，采样/导出/刷新并发进行时无半更新状态（`go test -race` 验证）。
 
@@ -55,9 +105,26 @@
 go build ./...        # 编译
 go vet ./...          # 静态检查
 go test -v ./...      # 单元测试（日志打印输入与判定依据）
-go test -race ./...   # 竞态检测
+go test -race ./...   # 竞态检测（重点覆盖并发去重 singleflight）
 ```
 
-测试覆盖：取消/超时链路的终止标记、慢速导出端背压、失败导出端重试与去重、
-重试耗尽丢弃、关闭后投递、v1 旧批次读取、未知字段保留、不支持版本拒绝、
-畸形批次拒绝、并发采集+配置更新+刷新的竞态一致性。
+测试覆盖：
+
+- **失败分级**：`TestPermanentFailureNoRetryAndDistinctReason`（永久失败零重试、
+  原因与其他三类互斥）、`TestPermanentFailureByMarkerInterface`（标记方法识别）、
+  `TestPermanentFailureClassification`（包装/取消边界）、
+  `TestTransientFailureStillRetriesToExhaustion`（暂时性失败照旧退避到耗尽）。
+- **去重**：`TestDuplicateSubmissionSuppressed`（重复投递只可见一次）、
+  `TestRetryFailureThenRedeliverySucceeds`（暂时性失败后可重投）、
+  `TestPermanentDuplicateSuppressedWithoutDoubleDrop`（永久失败重复不二次上报）、
+  `TestDedupConcurrentSingleflight` / `TestDedupConcurrentPermanentOnlyOnce`
+  （并发场景只产生一次可见到达，`-race` 下验证）、
+  `TestDedupFIFOEvictionBounded`（容量上限与 FIFO 淘汰）。
+- **字段兼容**：`TestRecordUnknownRoundTrip`（记录级未知字段往返保留）、
+  `TestReencodeStable`（反复编码字节级稳定）、`TestFutureRecordFieldsPreserved`
+  （未来版本记录字段前向兼容）、`TestV1V2ReadReencodeToV3`（旧版本读取重编码）、
+  `TestDuplicateRecordTagRejected`（重复标签判畸形）。
+- **既有用例不回归**：取消/超时链路终止标记、慢导出背压、失败重试与去重、
+  关闭后投递、v1 旧批次读取、批次级未知字段保留、不支持版本拒绝、畸形批次拒绝、
+  并发采集+配置更新+刷新的竞态一致性。
+
