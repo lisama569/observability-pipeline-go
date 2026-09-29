@@ -29,23 +29,70 @@
 
 ## 版本兼容规则
 
-批次编码布局：`magic(2) | version(2) | [source(v2)] | records | unknown`。
+批次编码当前写出 **v3**，布局：
 
-- 当前写出版本为 **v2**（新增 `Source` 字段）；**v1** 写出的批次在新版本中
-  仍可被正确读取（`Source` 置空）。
-- 解码遇到**未知字段**时保留进 `Batch.Unknown`，重编码不丢失。
+```
+magic(2) | version(2) | source(v2+) | nrecords(4) | records... | nunknown(4) | unknown...
+```
+
+v3 的每条记录为长度前缀自描述分帧：
+
+```
+rlen(4) | trace(8) | span(8) | level(1) | term(1)
+        | message | termreason | nattrs(2) attrs...
+        | nunknown(4) record-unknown...
+```
+
+- **读旧数据**：v1（无 `Source`）、v2（有 `Source`、记录不分帧）写出的批次在
+  v3 中仍可正确读取；写出时统一升级为 v3。
+- **批次级未知字段**：解码时保留进 `Batch.Unknown`，重编码不丢失。
+- **记录级未知字段（v3）**：记录帧尾部的未知字段保留进 `Record.Unknown`，
+  「读旧数据 → 修改 → 重新编码写回」的往返中原样保留，不丢字段、不错位。
+  帧长度前缀把单条记录严格界定，帧内未被完整消耗即判 `ErrMalformed`。
+- **稳定重编码**：所有 map 型字段（属性、两级未知字段）按 key 排序后写出，
+  同一份输入反复编码结果字节级一致，解码后再编码也与原编码一致，便于 diff 比对。
 - **不支持的版本**返回 `ErrUnsupportedVersion`，明确拒绝而不是按默认值继续。
-- **畸形数据**（坏 magic、截断、超长长度、尾部多余字节）返回 `ErrMalformed`，
-  严格边界检查避免静默错列。
+- **畸形数据**（坏 magic、截断、超长长度、记录帧内多余字节、尾部多余字节）
+  返回 `ErrMalformed`，严格边界检查避免静默错列。
 
-## 背压与丢弃策略
+## 导出失败分级与重试
+
+导出端返回的错误先做生命周期判定，再做永久/临时分级：
+
+| 错误情形 | 处理 | 丢弃原因 |
+|----------|------|----------|
+| 成功 | 结束 | —— |
+| 上下文取消 / 超时（含导出返回被包装的 ctx 错误） | 立即停止 | `DropCanceled` |
+| **永久失败**：接收端明确拒收（实现 `PermanentError` 或用 `MarkPermanent` 包装） | **立即停止，不重试、不退避等待** | `DropPermanentlyRejected` |
+| **暂时性失败**：其余错误 | 指数退避重试，预算用尽才丢 | `DropRetryExhausted` |
+| 队列满 / 管线关闭后投递 | 不重试 | `DropQueueFull` / `DropCanceled` |
+
+- `IsPermanent(err)` 识别被 `%w` 包装的永久失败；`context.Canceled` /
+  `context.DeadlineExceeded` 永远不算永久失败（那是调用方生命周期终止）。
+- 四类丢弃原因字符串互异：`queue_full` / `retry_exhausted` / `canceled` /
+  `permanently_rejected`，永久拒绝不再与重试耗尽混报。
+
+## 投递去重（exactly-once 可见）
+
+管线自身（而非调用方）保证「同一 `Batch.ID` 投多少次，接收端最终只可见一次」，
+对以下场景都成立：
+
+- 同一批次成功送达后再次提交（含调用方重试式重复投递）；
+- 同一批次正在导出时被并发提交（并发重试）——后来者等待主导者结束，
+  主导者已送达则直接跳过，不再调用接收端。
+
+未送达（临时失败重试中、取消、永久拒绝）不记入去重表，允许后续重新投递；
+只有接收端成功可见后才记录该 ID。
+
+去重状态**有界**：已送达 ID 存放在容量 `Config.DedupCap`（`<=0` 用默认
+`DefaultDedupCap=4096`）的 **LRU** 表中，满时淘汰最近最少使用的 ID，
+重复提交会刷新其位置。被淘汰 ID 再次提交视为新批次——这是有界内存下的明确取舍，
+容量应按「时间窗口内可能重投的不同批次数」来配置。
+
+## 背压与其他策略
 
 - 导出队列容量固定（`Config.QueueSize`），是采集侧的内存开销上限；
   `Submit` 非阻塞，队列满立即丢弃，采集侧绝不无界堆积。
-- 导出失败按指数退避重试（`Config.Retries` 次）；重试针对同一 `Batch.ID`，
-  接收端按 ID 去重，不产生重复可见数据。
-- 丢弃必须携带可区分原因并回调 `DropHandler`：
-  `DropQueueFull`（背压）、`DropRetryExhausted`（重试耗尽）、`DropCanceled`（关闭/取消）。
 - 配置通过 `atomic.Pointer` 整体替换：采样、缓存、攒批参数要么全部生效要么
   全部不生效，采样/导出/刷新并发进行时无半更新状态（`go test -race` 验证）。
 
@@ -55,9 +102,24 @@
 go build ./...        # 编译
 go vet ./...          # 静态检查
 go test -v ./...      # 单元测试（日志打印输入与判定依据）
-go test -race ./...   # 竞态检测
+go test -race ./...   # 竞态检测（重点看并发去重用例）
 ```
 
-测试覆盖：取消/超时链路的终止标记、慢速导出端背压、失败导出端重试与去重、
-重试耗尽丢弃、关闭后投递、v1 旧批次读取、未知字段保留、不支持版本拒绝、
-畸形批次拒绝、并发采集+配置更新+刷新的竞态一致性。
+重点新增用例：
+
+- `TestPermanentFailureNoRetry` / `TestPermanentFailureReasonDistinct`：
+  永久失败只尝试一次、立即以 `permanently_rejected` 丢弃，与其他原因可区分；
+- `TestRedeliverySeenOnce` / `TestConcurrentSubmitSeenOnce`：同一批次重复、
+  并发投递，接收端恰好可见一次；
+- `TestDeduperLRUEviction` / `TestDeduperUndeliveredRetriable`：LRU 容量淘汰、
+  未送达不入表；
+- `TestRecordUnknownFieldsRoundTrip` / `TestReencodeStable`：记录级+批次级
+  未知字段往返保留、反复编码字节级稳定；
+- `TestMalformedV3RecordRejected`：v3 记录帧截断/多余字节被拒绝。
+
+既有不回归用例：取消链路终止标记（`TestPipelineEndToEnd`）、慢导出背压
+（`TestBackpressureQueueFull`、`TestFlushTimeout`）、临时失败重试与耗尽
+（`TestRetryNoDuplicateVisible`、`TestRetryExhaustedDrop`）、关闭后投递
+（`TestSubmitAfterClose`）、畸形批次（`TestMalformedBatchRejected`）、
+v1 旧版本读取（`TestDecodeV1Batch`）、并发采集+配置更新竞态
+（`TestPipelineConcurrentRace`）。

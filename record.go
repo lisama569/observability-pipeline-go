@@ -20,4 +20,7 @@ type Record struct {
 	Terminated bool
 	// TermReason 记录链路终止原因（canceled/timeout）。
 	TermReason string
+	// Unknown 保留该记录解码时遇到的未知字段（v3 起按长度前缀自描述），
+	// 读旧数据再写回时原样保留，不丢失、不错位。
+	Unknown map[string][]byte
 }

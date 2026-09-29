@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,10 +29,13 @@ type DropReason int
 const (
 	// DropQueueFull 队列满，背压触发丢弃。
 	DropQueueFull DropReason = iota
-	// DropRetryExhausted 重试耗尽，无法送达。
+	// DropRetryExhausted 暂时性失败重试到预算用尽仍无法送达。
 	DropRetryExhausted
 	// DropCanceled 管线关闭或上下文取消导致丢弃。
 	DropCanceled
+	// DropPermanentlyRejected 接收端明确拒绝这批数据（永久失败），
+	// 立即停止重试，与“重试耗尽”明确区分。
+	DropPermanentlyRejected
 )
 
 func (r DropReason) String() string {
@@ -40,21 +44,24 @@ func (r DropReason) String() string {
 		return "queue_full"
 	case DropRetryExhausted:
 		return "retry_exhausted"
-	default:
+	case DropCanceled:
 		return "canceled"
+	default:
+		return "permanently_rejected"
 	}
 }
 
 // DropHandler 在数据被丢弃时回调，携带可区分的原因。
 type DropHandler func(b Batch, reason DropReason)
 
-// Dispatcher 提供有界队列、背压与重试。
+// Dispatcher 提供有界队列、背压、失败分级重试与投递去重。
 // 队列容量固定：导出慢时采集侧在队列满后直接丢弃并回调原因，不无界堆积。
 type Dispatcher struct {
 	exp     Exporter
 	onDrop  DropHandler
 	retries int
 	backoff time.Duration
+	dedup   *Deduper
 
 	queue  chan Batch
 	done   chan struct{}
@@ -64,7 +71,7 @@ type Dispatcher struct {
 	inflight atomic.Int64
 }
 
-func NewDispatcher(exp Exporter, queueSize, retries int, onDrop DropHandler) *Dispatcher {
+func NewDispatcher(exp Exporter, queueSize, retries, dedupCap int, onDrop DropHandler) *Dispatcher {
 	if queueSize < 1 {
 		queueSize = 1
 	}
@@ -76,6 +83,7 @@ func NewDispatcher(exp Exporter, queueSize, retries int, onDrop DropHandler) *Di
 		onDrop:  onDrop,
 		retries: retries,
 		backoff: 5 * time.Millisecond,
+		dedup:   NewDeduper(dedupCap),
 		queue:   make(chan Batch, queueSize),
 		done:    make(chan struct{}),
 	}
@@ -112,7 +120,6 @@ func (d *Dispatcher) Start(ctx context.Context) {
 }
 
 // run 消费队列并带重试导出，直到 Close 且队列排空。
-// 重试针对同一 Batch.ID 进行，接收端可按 ID 去重，不产生重复可见数据。
 func (d *Dispatcher) run(ctx context.Context) {
 	for {
 		select {
@@ -134,15 +141,35 @@ func (d *Dispatcher) run(ctx context.Context) {
 
 func (d *Dispatcher) exportWithRetry(ctx context.Context, b Batch) {
 	defer d.inflight.Add(-1)
+	// 投递前去重：已送达过的批次与并发中的重复批次都不再调用接收端，
+	// 由管线自身（而非调用方）保证同一 Batch.ID 最终只可见一次。
+	leader, finish := d.dedup.Begin(b.ID)
+	if !leader {
+		return
+	}
+	delivered := false
+	defer func() { finish(delivered) }()
 	attempts := d.retries + 1
 	for i := 0; i < attempts; i++ {
 		if err := ctx.Err(); err != nil {
 			d.onDrop(b, DropCanceled)
 			return
 		}
-		if err := d.exp.Export(ctx, b); err == nil {
+		err := d.exp.Export(ctx, b)
+		switch {
+		case err == nil:
+			delivered = true
+			return
+		case ctx.Err() != nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// 生命周期终止优先于永久失败判定，不按业务拒绝处理。
+			d.onDrop(b, DropCanceled)
+			return
+		case IsPermanent(err):
+			// 接收端明确不要这批数据：立即停止，不再消耗重试预算与退避时间。
+			d.onDrop(b, DropPermanentlyRejected)
 			return
 		}
+		// 暂时性失败：指数退避后重试，预算用尽才丢弃。
 		select {
 		case <-ctx.Done():
 			d.onDrop(b, DropCanceled)

@@ -83,3 +83,54 @@ type BusinessError interface {
 	error
 	IsBusinessError()
 }
+
+// PermanentError 表示接收端明确拒绝该批数据的永久失败：
+// 数据本身不被接受，继续重试只会得到同样的结论。
+// 导出端返回（或包装）实现该接口的错误时，管线立即停止重试。
+type PermanentError interface {
+	error
+	IsPermanent()
+}
+
+// PermanentFailure 把一个错误显式包装为永久失败。
+// 已归类为永久失败的错误原样返回，不重复包装。
+type PermanentFailure struct {
+	Cause error
+}
+
+func (e *PermanentFailure) Error() string {
+	if e.Cause == nil {
+		return "permanent failure"
+	}
+	return "permanent failure: " + e.Cause.Error()
+}
+
+func (e *PermanentFailure) Unwrap() error { return e.Cause }
+
+// IsPermanent 标记该错误为永久失败。
+func (e *PermanentFailure) IsPermanent() {}
+
+// MarkPermanent 把任意错误包装为永久失败；nil 原样返回。
+func MarkPermanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsPermanent(err) {
+		return err
+	}
+	return &PermanentFailure{Cause: err}
+}
+
+// IsPermanent 判定错误（含被包装的底层错误）是否为永久失败。
+// 取消/超时属于调用方生命周期终止而非接收端拒绝，不作为永久失败；
+// 因此判定时先排除 context 错误。
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var pe PermanentError
+	return errors.As(err, &pe)
+}

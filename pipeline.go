@@ -17,6 +17,8 @@ type Config struct {
 	QueueSize int
 	// Retries 导出失败时的最大重试次数。
 	Retries int
+	// DedupCap 批次投递去重表容量（LRU 淘汰），<=0 时使用默认值。
+	DedupCap int
 	// BatchSize 攒批大小，达到即投递。
 	BatchSize int
 }
@@ -59,7 +61,7 @@ type Pipeline struct {
 func NewPipeline(cfg Config, exp Exporter, onDrop DropHandler) *Pipeline {
 	cfg = cfg.normalized()
 	p := &Pipeline{
-		disp:  NewDispatcher(exp, cfg.QueueSize, cfg.Retries, onDrop),
+		disp:  NewDispatcher(exp, cfg.QueueSize, cfg.Retries, cfg.DedupCap, onDrop),
 		cache: NewCache(cfg.CacheCap),
 	}
 	p.cfg.Store(&cfg)

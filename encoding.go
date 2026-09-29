@@ -13,8 +13,11 @@ const (
 	Version1 uint16 = 1
 	// Version2 在版本头后新增 Source 字段；旧版本写出的批次仍可读。
 	Version2 uint16 = 2
+	// Version3 记录改为长度前缀自描述分帧，并支持记录级未知字段；
+	// v1/v2 写出的批次仍可读。
+	Version3 uint16 = 3
 	// CurrentVersion 是当前写出版本。
-	CurrentVersion = Version2
+	CurrentVersion = Version3
 )
 
 var magic = []byte{'O', 'B'}
@@ -90,15 +93,18 @@ func (r *reader) bytes() []byte {
 
 type writer struct{ buf []byte }
 
-func (w *writer) u8(v byte)     { w.buf = append(w.buf, v) }
-func (w *writer) u16(v uint16)  { w.buf = binary.LittleEndian.AppendUint16(w.buf, v) }
-func (w *writer) u32(v uint32)  { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
-func (w *writer) u64(v uint64)  { w.buf = binary.LittleEndian.AppendUint64(w.buf, v) }
-func (w *writer) str(s string)  { w.u32(uint32(len(s))); w.buf = append(w.buf, s...) }
+func (w *writer) u8(v byte)      { w.buf = append(w.buf, v) }
+func (w *writer) u16(v uint16)   { w.buf = binary.LittleEndian.AppendUint16(w.buf, v) }
+func (w *writer) u32(v uint32)   { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
+func (w *writer) u64(v uint64)   { w.buf = binary.LittleEndian.AppendUint64(w.buf, v) }
+func (w *writer) str(s string)   { w.u32(uint32(len(s))); w.buf = append(w.buf, s...) }
 func (w *writer) bytes(b []byte) { w.u32(uint32(len(b))); w.buf = append(w.buf, b...) }
 
 // EncodeBatch 将批次编码为带版本头的字节流。
-// 布局：magic(2) | version(2) | source(仅 v2) | nrecords(4) | records... | nunknown(4) | unknown...
+// v3 布局：magic(2) | version(2) | source | nrecords(4) | records(v3 分帧)... | nunknown(4) | unknown...
+// 每条 v3 记录：rlen(4) | trace(8) | span(8) | level(1) | term(1) |
+//
+//	message | termreason | nattrs(2) attrs... | nunknown(4) unknown...
 func EncodeBatch(b Batch) ([]byte, error) {
 	w := &writer{}
 	w.buf = append(w.buf, magic...)
@@ -106,44 +112,59 @@ func EncodeBatch(b Batch) ([]byte, error) {
 	w.str(b.Source) // v2 字段
 	w.u32(uint32(len(b.Records)))
 	for _, rec := range b.Records {
-		w.u64(rec.TraceID)
-		w.u64(rec.SpanID)
-		w.u8(byte(rec.Level))
-		var term byte
-		if rec.Terminated {
-			term = 1
-		}
-		w.u8(term)
-		w.str(rec.Message)
-		w.str(rec.TermReason)
-		keys := make([]string, 0, len(rec.Attrs))
-		for k := range rec.Attrs {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		w.u16(uint16(len(keys)))
-		for _, k := range keys {
-			w.str(k)
-			w.str(rec.Attrs[k])
-		}
+		payload := encodeRecordV3(rec)
+		w.bytes(payload) // v3：记录以 u32 长度前缀自描述分帧
 	}
-	ukeys := make([]string, 0, len(b.Unknown))
-	for k := range b.Unknown {
-		ukeys = append(ukeys, k)
-	}
-	sort.Strings(ukeys)
-	w.u32(uint32(len(ukeys)))
-	for _, k := range ukeys {
-		w.str(k)
-		w.bytes(b.Unknown[k])
-	}
+	writeUnknown(w, b.Unknown)
 	return w.buf, nil
+}
+
+// encodeRecordV3 编码单条 v3 记录的载荷（不含外层长度前缀）。
+func encodeRecordV3(rec Record) []byte {
+	w := &writer{}
+	w.u64(rec.TraceID)
+	w.u64(rec.SpanID)
+	w.u8(byte(rec.Level))
+	var term byte
+	if rec.Terminated {
+		term = 1
+	}
+	w.u8(term)
+	w.str(rec.Message)
+	w.str(rec.TermReason)
+	keys := make([]string, 0, len(rec.Attrs))
+	for k := range rec.Attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	w.u16(uint16(len(keys)))
+	for _, k := range keys {
+		w.str(k)
+		w.str(rec.Attrs[k])
+	}
+	writeUnknown(w, rec.Unknown)
+	return w.buf
+}
+
+// writeUnknown 以排序后的稳定顺序写出未知字段区：nunknown(4) | (key,value)...
+func writeUnknown(w *writer, unknown map[string][]byte) {
+	keys := make([]string, 0, len(unknown))
+	for k := range unknown {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	w.u32(uint32(len(keys)))
+	for _, k := range keys {
+		w.str(k)
+		w.bytes(unknown[k])
+	}
 }
 
 // DecodeBatch 解码批次。
 //   - 不支持的版本返回 ErrUnsupportedVersion，明确拒绝而不是按默认值继续；
 //   - 畸形数据返回 ErrMalformed，严格边界检查避免静默错列；
-//   - 未知字段被保留进 Batch.Unknown，重编码时不丢失。
+//   - 批次级未知字段保留进 Batch.Unknown，v3 起记录级未知字段保留进
+//     Record.Unknown，重编码时均不丢失、不错位。
 func DecodeBatch(data []byte) (Batch, error) {
 	r := &reader{buf: data}
 	m, _ := r.take(2)
@@ -161,28 +182,26 @@ func DecodeBatch(data []byte) (Batch, error) {
 		// v1 无 Source 字段
 	case Version2:
 		b.Source = r.str()
+	case Version3:
+		b.Source = r.str()
 	default:
 		return Batch{}, fmt.Errorf("%w: %d", ErrUnsupportedVersion, version)
 	}
 	n := r.u32()
 	for i := uint32(0); i < n && r.err == nil; i++ {
-		rec := Record{
-			TraceID:    r.u64(),
-			SpanID:     r.u64(),
-			Level:      Level(r.u8()),
-			Terminated: r.u8() == 1,
-			Message:    r.str(),
-			TermReason: r.str(),
-		}
-		nattrs := r.u16()
-		if nattrs > 0 {
-			rec.Attrs = make(map[string]string, nattrs)
-			for j := uint16(0); j < nattrs; j++ {
-				k := r.str()
-				rec.Attrs[k] = r.str()
+		if version == Version3 {
+			payload := r.bytes() // 整条记录由 u32 长度前缀界定
+			if r.err != nil {
+				return Batch{}, r.err
 			}
+			rec, err := decodeRecordV3(payload)
+			if err != nil {
+				return Batch{}, err
+			}
+			b.Records = append(b.Records, rec)
+			continue
 		}
-		b.Records = append(b.Records, rec)
+		b.Records = append(b.Records, decodeRecordLegacy(r))
 	}
 	if r.err != nil {
 		return Batch{}, r.err
@@ -203,4 +222,51 @@ func DecodeBatch(data []byte) (Batch, error) {
 		return Batch{}, fmt.Errorf("%w: %d trailing bytes", ErrMalformed, len(r.buf)-r.off)
 	}
 	return b, nil
+}
+
+// decodeRecordLegacy 解析 v1/v2 记录：无长度前缀、无记录级未知字段区。
+func decodeRecordLegacy(r *reader) Record {
+	rec := Record{
+		TraceID:    r.u64(),
+		SpanID:     r.u64(),
+		Level:      Level(r.u8()),
+		Terminated: r.u8() == 1,
+		Message:    r.str(),
+		TermReason: r.str(),
+	}
+	nattrs := r.u16()
+	if nattrs > 0 {
+		rec.Attrs = make(map[string]string, nattrs)
+		for j := uint16(0); j < nattrs; j++ {
+			k := r.str()
+			rec.Attrs[k] = r.str()
+		}
+	}
+	return rec
+}
+
+// decodeRecordV3 在单条记录帧内严格解析；帧未被完整消耗即判定畸形，
+// 不允许未知字段静默错位。记录级未知字段被完整保留。
+func decodeRecordV3(payload []byte) (Record, error) {
+	r := &reader{buf: payload}
+	rec := decodeRecordLegacy(r)
+	if r.err != nil {
+		return Record{}, r.err
+	}
+	nunknown := r.u32()
+	for i := uint32(0); i < nunknown && r.err == nil; i++ {
+		k := r.str()
+		v := r.bytes()
+		if rec.Unknown == nil {
+			rec.Unknown = make(map[string][]byte)
+		}
+		rec.Unknown[k] = v
+	}
+	if r.err != nil {
+		return Record{}, r.err
+	}
+	if r.off != len(r.buf) {
+		return Record{}, fmt.Errorf("%w: %d trailing record bytes", ErrMalformed, len(r.buf)-r.off)
+	}
+	return rec, nil
 }
