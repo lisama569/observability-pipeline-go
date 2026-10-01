@@ -44,7 +44,7 @@ func (r *countingReceiver) arrivals(id uint64) int {
 func TestRedeliverySeenOnce(t *testing.T) {
 	recv := &countingReceiver{}
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 16, 0, 64, drops.handler())
+	d := NewDispatcher(recv, 16, 0, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 	for i := 0; i < 5; i++ {
 		d.Submit(Batch{ID: 77, Records: []Record{{Message: "x"}}})
@@ -65,7 +65,7 @@ func TestConcurrentSubmitSeenOnce(t *testing.T) {
 	release := make(chan struct{})
 	recv.block[5] = release // 主导者导出期间阻塞，制造并发窗口
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 128, 0, 64, drops.handler())
+	d := NewDispatcher(recv, 128, 0, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 
 	const n = 16
@@ -96,7 +96,7 @@ func TestConcurrentSubmitSeenOnce(t *testing.T) {
 func TestDeduperLRUEviction(t *testing.T) {
 	const cap = 3
 	dd := NewDeduper(cap)
-	beginDelivered := func(id uint64) func(bool) {
+	beginDelivered := func(id uint64) func(DedupOutcome) {
 		leader, finish := dd.Begin(id)
 		if !leader {
 			t.Fatalf("id=%d 首次提交应为 leader", id)
@@ -106,9 +106,9 @@ func TestDeduperLRUEviction(t *testing.T) {
 	finish1 := beginDelivered(1)
 	finish2 := beginDelivered(2)
 	finish3 := beginDelivered(3)
-	finish1(true)
-	finish2(true)
-	finish3(true)
+	finish1(OutcomeDelivered)
+	finish2(OutcomeDelivered)
+	finish3(OutcomeDelivered)
 	if dd.Len() != 3 {
 		t.Fatalf("Len=%d, want 3", dd.Len())
 	}
@@ -121,7 +121,7 @@ func TestDeduperLRUEviction(t *testing.T) {
 	if !leader4 {
 		t.Fatal("id=4 为新批次, 应为 leader")
 	}
-	finish4(true)
+	finish4(OutcomeDelivered)
 	if dd.Len() != cap {
 		t.Errorf("淘汰后 Len=%d, want %d", dd.Len(), cap)
 	}
@@ -144,7 +144,7 @@ func TestDeduperUndeliveredRetriable(t *testing.T) {
 	if !leader {
 		t.Fatal("首次提交应为 leader")
 	}
-	finish(false)
+	finish(OutcomeUnsettled)
 	leader, _ = dd.Begin(9)
 	if !leader {
 		t.Error("未送达的批次不应进入去重表, 重新投递应为 leader")

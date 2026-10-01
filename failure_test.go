@@ -45,7 +45,7 @@ func (r *rejectingReceiver) Export(ctx context.Context, b Batch) error {
 func TestPermanentFailureNoRetry(t *testing.T) {
 	recv := &rejectingReceiver{permanent: true}
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 8, 5, 64, drops.handler())
+	d := NewDispatcher(recv, 8, 5, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 
 	start := time.Now()

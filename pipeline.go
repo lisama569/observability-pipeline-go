@@ -61,7 +61,7 @@ type Pipeline struct {
 func NewPipeline(cfg Config, exp Exporter, onDrop DropHandler) *Pipeline {
 	cfg = cfg.normalized()
 	p := &Pipeline{
-		disp:  NewDispatcher(exp, cfg.QueueSize, cfg.Retries, cfg.DedupCap, onDrop),
+		disp:  NewDispatcher(exp, cfg.QueueSize, cfg.Retries, onDrop, WithDedupCap(cfg.DedupCap)),
 		cache: NewCache(cfg.CacheCap),
 	}
 	p.cfg.Store(&cfg)

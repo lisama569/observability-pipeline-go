@@ -73,7 +73,7 @@ func (d *dropLog) count(r DropReason) int {
 func TestBackpressureQueueFull(t *testing.T) {
 	recv := &receiver{seen: map[uint64]int{}, delay: 20 * time.Millisecond}
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 2, 0, 64, drops.handler())
+	d := NewDispatcher(recv, 2, 0, drops.handler(), WithDedupCap(64))
 	ctx := context.Background()
 	d.Start(ctx)
 
@@ -99,7 +99,7 @@ func TestBackpressureQueueFull(t *testing.T) {
 func TestRetryNoDuplicateVisible(t *testing.T) {
 	recv := &receiver{seen: map[uint64]int{}, fail: 2} // 前 2 次失败
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 8, 3, 64, drops.handler())
+	d := NewDispatcher(recv, 8, 3, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 	d.Submit(Batch{ID: 1, Records: []Record{{Message: "a"}}})
 	d.Close()
@@ -116,7 +116,7 @@ func TestRetryNoDuplicateVisible(t *testing.T) {
 func TestRetryExhaustedDrop(t *testing.T) {
 	recv := &receiver{seen: map[uint64]int{}, fail: 100} // 永远失败
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 8, 2, 64, drops.handler())
+	d := NewDispatcher(recv, 8, 2, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 	d.Submit(Batch{ID: 1, Records: []Record{{Message: "a"}}})
 	d.Close()
@@ -133,7 +133,7 @@ func TestRetryExhaustedDrop(t *testing.T) {
 func TestSubmitAfterClose(t *testing.T) {
 	recv := &receiver{seen: map[uint64]int{}}
 	drops := &dropLog{}
-	d := NewDispatcher(recv, 1, 0, 64, drops.handler())
+	d := NewDispatcher(recv, 1, 0, drops.handler(), WithDedupCap(64))
 	d.Start(context.Background())
 	d.Close()
 	d.Submit(Batch{ID: 1})

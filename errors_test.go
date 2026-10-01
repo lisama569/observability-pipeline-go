@@ -9,7 +9,7 @@ import (
 
 type bizErr struct{ msg string }
 
-func (e bizErr) Error() string   { return e.msg }
+func (e bizErr) Error() string    { return e.msg }
 func (e bizErr) IsBusinessError() {}
 
 func TestClassify(t *testing.T) {
