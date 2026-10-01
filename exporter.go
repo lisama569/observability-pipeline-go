@@ -90,12 +90,19 @@ func NewDispatcher(exp Exporter, queueSize, retries, dedupCap int, onDrop DropHa
 }
 
 // Submit 非阻塞投递；队列满时按策略丢弃并回调 DropQueueFull。
+// 已有终态结论（已送达/已拒收）的批次在入队前即被静默抑制：不占队列
+// 容量、不报任何丢弃——重投一个被明确拒收过的批次，绝不可能再产生
+// 一次 queue_full；在途重复不做此抑制，主导者失败时要靠等待者接管。
 func (d *Dispatcher) Submit(b Batch) {
 	select {
 	case <-d.done:
 		d.onDrop(b, DropCanceled)
 		return
 	default:
+	}
+	// 入队前非阻塞终态抑制：已送达/已拒收批次的重投不进队列、不报丢弃。
+	if _, ok := d.dedup.KnownTerminal(b.ID); ok {
+		return
 	}
 	select {
 	case d.queue <- b:
@@ -141,14 +148,15 @@ func (d *Dispatcher) run(ctx context.Context) {
 
 func (d *Dispatcher) exportWithRetry(ctx context.Context, b Batch) {
 	defer d.inflight.Add(-1)
-	// 投递前去重：已送达过的批次与并发中的重复批次都不再调用接收端，
-	// 由管线自身（而非调用方）保证同一 Batch.ID 最终只可见一次。
-	leader, finish := d.dedup.Begin(b.ID)
+	// 投递前去重：已送达过、被永久拒收过的批次与并发中的重复批次都不再
+	// 调用接收端，由管线自身（而非调用方）保证同一 Batch.ID 最终只可见
+	// 一次；重复的永久拒收也不会再上报一次丢弃。
+	leader, _, finish := d.dedup.BeginEx(b.ID)
 	if !leader {
 		return
 	}
-	delivered := false
-	defer func() { finish(delivered) }()
+	outcome := OutcomeUndelivered
+	defer func() { finish(outcome) }()
 	attempts := d.retries + 1
 	for i := 0; i < attempts; i++ {
 		if err := ctx.Err(); err != nil {
@@ -158,14 +166,18 @@ func (d *Dispatcher) exportWithRetry(ctx context.Context, b Batch) {
 		err := d.exp.Export(ctx, b)
 		switch {
 		case err == nil:
-			delivered = true
+			outcome = OutcomeDelivered
 			return
 		case ctx.Err() != nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			// 生命周期终止优先于永久失败判定，不按业务拒绝处理。
+			// 生命周期终止优先于永久失败判定，不按业务拒绝处理；
+			// 不入去重表，之后重新投递仍会正常送到接收端。
 			d.onDrop(b, DropCanceled)
 			return
 		case IsPermanent(err):
-			// 接收端明确不要这批数据：立即停止，不再消耗重试预算与退避时间。
+			// 接收端明确不要这批数据：立即停止，不再消耗重试预算与退避时间；
+			// ID 记入去重表，后续同一批次的重复投递不再打到接收端，
+			// 也不会再产生一次丢弃上报。
+			outcome = OutcomeRejected
 			d.onDrop(b, DropPermanentlyRejected)
 			return
 		}

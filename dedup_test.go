@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -152,4 +153,162 @@ func TestDeduperUndeliveredRetriable(t *testing.T) {
 	if dd.Len() != 0 {
 		t.Errorf("未送达不记录, Len=%d, want 0", dd.Len())
 	}
+}
+
+// TestDeduperRejectedRecorded 被永久拒收的批次必须记为终态：
+// 后续重复投递不再成为主导者（不会再打到接收端），且能取到拒收结论；
+// 重复提交只刷新 LRU 位置，不新增条目。
+func TestDeduperRejectedRecorded(t *testing.T) {
+	dd := NewDeduper(8)
+	leader, _, finish := dd.BeginEx(42)
+	if !leader {
+		t.Fatal("首次提交应为 leader")
+	}
+	finish(OutcomeRejected)
+	if got, ok := dd.OutcomeOf(42); !ok || got != OutcomeRejected {
+		t.Fatalf("拒收后 OutcomeOf=(%v,%v), want (%v,true)", got, ok, OutcomeRejected)
+	}
+	if dd.Len() != 1 {
+		t.Fatalf("拒收应记录一条, Len=%d, want 1", dd.Len())
+	}
+	for i := 0; i < 3; i++ {
+		leader, known, finish := dd.BeginEx(42)
+		if leader {
+			t.Fatalf("拒收批次第 %d 次重投不应再成为主导者", i+1)
+		}
+		if known != OutcomeRejected {
+			t.Errorf("重复投递应取到拒收结论, got %v", known)
+		}
+		finish(OutcomeRejected) // 非主导者的 finish 必须是空操作
+	}
+	if dd.Len() != 1 {
+		t.Errorf("重复投递不得新增条目, Len=%d, want 1", dd.Len())
+	}
+}
+
+// TestDeduperRejectedVersusDelivered 已送达与已拒收结论互不混淆，
+// 未送达结论绝不落表。
+func TestDeduperRejectedVersusDelivered(t *testing.T) {
+	dd := NewDeduper(8)
+	_, _, f1 := dd.BeginEx(1)
+	f1(OutcomeDelivered)
+	_, _, f2 := dd.BeginEx(2)
+	f2(OutcomeRejected)
+	_, _, f3 := dd.BeginEx(3)
+	f3(OutcomeUndelivered)
+
+	if got, ok := dd.OutcomeOf(1); !ok || got != OutcomeDelivered {
+		t.Errorf("id=1: (%v,%v), want delivered", got, ok)
+	}
+	if got, ok := dd.OutcomeOf(2); !ok || got != OutcomeRejected {
+		t.Errorf("id=2: (%v,%v), want rejected", got, ok)
+	}
+	if _, ok := dd.OutcomeOf(3); ok {
+		t.Error("id=3 未送达不应落表")
+	}
+	if dd.Len() != 2 {
+		t.Errorf("Len=%d, want 2", dd.Len())
+	}
+}
+
+// TestDeduperLRUEvictionMixedOutcomes 已送达与已拒收条目共用一张
+// 有界 LRU，淘汰规则对两者一致；被淘汰的拒收 ID 重投视为新批次。
+func TestDeduperLRUEvictionMixedOutcomes(t *testing.T) {
+	const cap = 2
+	dd := NewDeduper(cap)
+	_, _, f1 := dd.BeginEx(1)
+	f1(OutcomeDelivered)
+	_, _, f2 := dd.BeginEx(2)
+	f2(OutcomeRejected)
+	// 触碰 id=1，插入 id=3 时应淘汰 id=2（拒收结论同样受容量约束）。
+	if leader, _, _ := dd.BeginEx(1); leader {
+		t.Fatal("id=1 已送达, 不应成为主导者")
+	}
+	leader, _, f3 := dd.BeginEx(3)
+	if !leader {
+		t.Fatal("id=3 为新批次, 应为 leader")
+	}
+	f3(OutcomeDelivered)
+	if _, ok := dd.OutcomeOf(2); ok {
+		t.Error("id=2 应已被 LRU 淘汰")
+	}
+	// 被淘汰的拒收 ID 重投成为新主导者——有界内存下的明确取舍。
+	if leader, _, _ := dd.BeginEx(2); !leader {
+		t.Error("已淘汰的拒收 ID 重投应视为新批次（leader）")
+	}
+}
+
+// TestDeduperConcurrentFollowerTakesOver 主导者未送达（临时失败/取消）
+// 时，并发等待者中必须有且仅有一个接管成为新主导者，重投不被吞掉；
+// 主导者成功后所有等待者都只能是非主导者，接收端不会被打到第二次。
+func TestDeduperConcurrentFollowerTakesOver(t *testing.T) {
+	t.Run("leader_fails_one_follower_takes_over", func(t *testing.T) {
+		dd := NewDeduper(8)
+		leader, _, finishLeader := dd.BeginEx(7)
+		if !leader {
+			t.Fatal("首次提交应为 leader")
+		}
+
+		const followers = 8
+
+		start := make(chan struct{})
+		var leaders int64
+		var wg sync.WaitGroup
+		wg.Add(followers)
+		for i := 0; i < followers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				l, _, f := dd.BeginEx(7)
+				if l {
+					atomic.AddInt64(&leaders, 1)
+					f(OutcomeDelivered) // 接管者送达成功
+				}
+			}()
+		}
+		// 确保所有追随者都已在等待主导者。
+		time.Sleep(20 * time.Millisecond)
+		finishLeader(OutcomeUndelivered) // 主导者失败
+		close(start)
+		wg.Wait()
+
+		if leaders != 1 {
+			t.Errorf("主导者未送达时应有且仅有 1 个追随者接管, got %d", leaders)
+		}
+		if got, ok := dd.OutcomeOf(7); !ok || got != OutcomeDelivered {
+			t.Errorf("接管者送达后应为 delivered, got (%v,%v)", got, ok)
+		}
+	})
+
+	t.Run("leader_delivers_all_followers_suppressed", func(t *testing.T) {
+		dd := NewDeduper(8)
+		leader, _, finishLeader := dd.BeginEx(8)
+		if !leader {
+			t.Fatal("首次提交应为 leader")
+		}
+
+		const followers = 8
+
+		start := make(chan struct{})
+		var leaders int64
+		var wg sync.WaitGroup
+		wg.Add(followers)
+		for i := 0; i < followers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				if l, _, _ := dd.BeginEx(8); l {
+					atomic.AddInt64(&leaders, 1)
+				}
+			}()
+		}
+		time.Sleep(20 * time.Millisecond)
+		finishLeader(OutcomeDelivered) // 主导者成功
+		close(start)
+		wg.Wait()
+
+		if leaders != 0 {
+			t.Errorf("主导者已送达, 追随者不应再成为主导者, got %d", leaders)
+		}
+	})
 }
